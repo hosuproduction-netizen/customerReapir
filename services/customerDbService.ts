@@ -1,78 +1,86 @@
-
-// Proxy 설정에 따라 5000번 포트로 자동 연결됩니다.
-const API_BASE_URL = '/api';
+// services/customerDbService.ts
+// repair_history 테이블 기반 고객 검색 서비스
 
 export interface CustomerDBEntry {
-  company_name?: string;
-  customer_name?: string;
-  position?: string;
-  address?: string;
-  mobile?: string;
-  phone?: string;
-  email?: string;
-  
-  // 기존 코드(App.tsx)와의 호환성을 위한 별칭 매핑
-  "고객명"?: string; 
-  "회사명"?: string;
-  "회사주소1"?: string;
-  "이동통신"?: string;
-  "직위"?: string;
-  "회사전화1"?: string;
   id?: number;
+  customer_name?: string;
+  mobile?: string;
+  company_name?: string;
+  // 기존 호환성 유지용 필드
+  고객명?: string;
+  이동통신?: string;
+  회사명?: string;
+  회사전화1?: string;
+  회사주소1?: string;
+  직위?: string;
+  position?: string;
 }
 
-// 1. 고객 이름으로 검색 (서버 API)
-export const searchCustomersByName = async (query: string): Promise<CustomerDBEntry[]> => {
-  if (!query) return [];
+// 고객명으로 repair_history에서 검색
+export async function searchCustomersByName(name: string): Promise<CustomerDBEntry[]> {
+  if (!name || name.trim() === '') return [];
   try {
-    const response = await fetch(`${API_BASE_URL}/customers/search?name=${encodeURIComponent(query)}`);
-    if (!response.ok) return [];
+    const res = await fetch(`/api/customers/search?name=${encodeURIComponent(name.trim())}`);
+    if (!res.ok) return [];
+    const data = await res.json();
     
-    const data = await response.json();
-    
+    // 응답 데이터를 기존 형식과 호환되도록 변환
     return data.map((item: any) => ({
-      ...item,
-      "고객명": item.customer_name,
-      "회사명": item.company_name,
-      "직위": item.position,
-      "회사주소1": item.address,
-      "이동통신": item.mobile,
-      "회사전화1": item.phone
+      고객명: item.customer_name || item['고객명_x'] || '',
+      이동통신: item.mobile || item['이동통신_x'] || '',
+      회사명: item.company_name || item['회사명'] || '',
+      회사전화1: '',
+      회사주소1: '',
+      직위: '',
     }));
   } catch (error) {
-    console.error("MySQL Search Error:", error);
+    console.error('고객 검색 오류:', error);
     return [];
   }
-};
+}
 
-// 2. 전체 고객 수 조회 (서버 API)
-export const getCustomerCount = async (): Promise<number> => {
+// repair_history 전체 건수 조회
+export async function getCustomerCount(): Promise<number> {
   try {
-    const response = await fetch(`${API_BASE_URL}/customers/count`);
-    if (!response.ok) return 0;
-    const data = await response.json();
+    const res = await fetch('/api/customers/count');
+    if (!res.ok) return 0;
+    const data = await res.json();
     return data.count || 0;
-  } catch (error) {
+  } catch {
     return 0;
   }
-};
+}
 
-// 3. 엑셀 파일 업로드 (서버 API)
-export const uploadExcelToServer = async (file: File): Promise<{count: number}> => {
+// ✅ SQL 파일 업로드 (기존 엑셀 업로드 대신)
+export async function uploadSqlToServer(file: File): Promise<{ count: number; errors: number }> {
   const formData = new FormData();
   formData.append('file', file);
 
-  const response = await fetch(`${API_BASE_URL}/upload-excel`, {
+  const res = await fetch('/api/upload-sql', {
     method: 'POST',
     body: formData,
   });
 
-  if (!response.ok) {
-    const errData = await response.json().catch(() => ({}));
-    throw new Error(errData.message || '업로드 실패');
+  const data = await res.json();
+  if (!res.ok || !data.success) {
+    throw new Error(data.message || 'SQL 업로드 실패');
   }
-  
-  return response.json();
-};
+  return { count: data.count, errors: data.errors || 0 };
+}
 
-export const saveCustomersToDB = async (data: any[]) => { console.warn('This function is deprecated.'); };
+// 기존 엑셀 업로드 함수 (호환성 유지, 실제로는 사용 안 함)
+export async function uploadExcelToServer(file: File): Promise<{ count: number }> {
+  const formData = new FormData();
+  formData.append('file', file);
+
+  const res = await fetch('/api/upload-excel', {
+    method: 'POST',
+    body: formData,
+  });
+
+  const data = await res.json();
+  if (!res.ok || !data.success) {
+    throw new Error(data.message || '업로드 실패');
+  }
+  return { count: data.count };
+}
