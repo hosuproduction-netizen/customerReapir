@@ -1,0 +1,5 @@
+{
+  "name": "하이픽셀플러스 서비스센터 입출고 시스템 개발",
+  "description": "A React application to send Kakao Alimtalk notifications using Solapi API with a clean UI.",
+  "requestFramePermissions": []
+}
