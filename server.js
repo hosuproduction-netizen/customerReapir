@@ -1,9 +1,7 @@
-
 import express from 'express';
 import mysql from 'mysql2/promise';
 import cors from 'cors';
 import multer from 'multer';
-import XLSX from 'xlsx';
 import crypto from 'crypto'; 
 import { createServer as createViteServer } from 'vite';
 
@@ -14,7 +12,7 @@ const PORT = 3000;
 const DB_CONFIG = {
   host: 'localhost',
   user: 'root',
-  password: 'password', // ⚠️ 여기에 본인의 MySQL 비밀번호를 입력해야 합니다!
+  password: '12345', // ⚠️ 여기에 본인의 MySQL 비밀번호를 입력해야 합니다!
   database: 'repair_system',
   waitForConnections: true,
   connectionLimit: 10,
@@ -31,13 +29,29 @@ const SOLAPI_CONFIG = {
 
 async function startServer() {
   const app = express();
-  const upload = multer({ storage: multer.memoryStorage() });
+  // SQL 파일은 용량이 클 수 있으므로 최대 200MB까지 허용
+  const upload = multer({ 
+    storage: multer.memoryStorage(),
+    limits: { fileSize: 200 * 1024 * 1024 }
+  });
 
   app.use(cors());
   app.use(express.json());
 
   // MySQL Connection Pool 생성
   const pool = mysql.createPool(DB_CONFIG);
+
+  // DB 연결 확인
+  try {
+    const conn = await pool.getConnection();
+    console.log('✅ MySQL 데이터베이스 연결 성공!');
+    const [rows] = await conn.query('SELECT COUNT(*) as count FROM repair_history');
+    console.log(`📊 현재 repair_history 테이블 데이터 수: ${rows[0].count}건`);
+    conn.release();
+  } catch (error) {
+    console.error('❌ MySQL 연결 실패:', error.message);
+    console.error('👉 DB_CONFIG의 비밀번호와 데이터베이스 이름을 확인해주세요.');
+  }
 
   // --- API 라우트 ---
 
@@ -89,88 +103,152 @@ async function startServer() {
     }
   });
 
-  // 2. 엑셀 파일 업로드 API
-  app.post('/api/upload-excel', upload.single('file'), async (req, res) => {
+  // 2. ✅ SQL 파일 업로드 API (새로 추가!)
+  // - .sql 파일을 업로드하면 repair_history 테이블에 데이터를 반영합니다
+  app.post('/api/upload-sql', upload.single('file'), async (req, res) => {
     if (!req.file) return res.status(400).json({ success: false, message: '파일이 없습니다.' });
+    
     let connection;
     try {
-      const workbook = XLSX.read(req.file.buffer, { type: 'buffer' });
-      const sheetName = workbook.SheetNames[0];
-      const data = XLSX.utils.sheet_to_json(workbook.Sheets[sheetName], { raw: false, defval: "" });
-      if (data.length === 0) return res.status(400).json({ success: false, message: '데이터가 없습니다.' });
-      connection = await pool.getConnection();
-      await connection.beginTransaction();
-      await connection.query('TRUNCATE TABLE customers');
-      const BATCH_SIZE = 1000;
-      const query = `INSERT INTO customers (company_name, customer_name, position, address, mobile, phone, email) VALUES ?`;
-      const findValue = (row, keys) => {
-          for (const key of keys) {
-              if (row[key] !== undefined && row[key] !== null && String(row[key]).trim() !== '') return String(row[key]).trim();
+      const sqlContent = req.file.buffer.toString('utf8');
+      
+      // SQL 파일에서 INSERT 문만 추출
+      const insertStatements = [];
+      const lines = sqlContent.split('\n');
+      let currentStatement = '';
+      
+      for (const line of lines) {
+        const trimmed = line.trim();
+        if (!trimmed || trimmed.startsWith('--')) continue; // 빈 줄, 주석 건너뜀
+        
+        currentStatement += ' ' + trimmed;
+        
+        if (trimmed.endsWith(';')) {
+          const stmt = currentStatement.trim();
+          // repair_history INSERT 문만 처리
+          if (stmt.toUpperCase().startsWith('INSERT INTO') && 
+              stmt.toLowerCase().includes('repair_history')) {
+            insertStatements.push(stmt);
           }
-          return '';
-      };
-      let totalInserted = 0;
-      for (let i = 0; i < data.length; i += BATCH_SIZE) {
-        const batch = data.slice(i, i + BATCH_SIZE);
-        const values = [];
-        for (const row of batch) {
-            const name = findValue(row, ['고객명', '이름', '성명', 'Customer Name', 'Name']);
-            if (!name) continue;
-            values.push([
-              findValue(row, ['회사명', '상호', 'Company', '소속']),
-              name,
-              findValue(row, ['직위', '직급', 'Position']),
-              findValue(row, ['회사주소1', '주소', 'Address', '배송지']),
-              findValue(row, ['이동통신', '휴대폰', 'Mobile', '연락처', 'Phone', 'HP']),
-              findValue(row, ['회사전화1', '전화', 'Tel', 'Tel No']),
-              findValue(row, ['전자우편1', '이메일', 'Email', 'E-mail'])
-            ]);
-        }
-        if (values.length > 0) {
-            const [result] = await connection.query(query, [values]);
-            totalInserted += result.affectedRows;
+          currentStatement = '';
         }
       }
+      
+      if (insertStatements.length === 0) {
+        return res.status(400).json({ 
+          success: false, 
+          message: 'SQL 파일에서 repair_history INSERT 문을 찾을 수 없습니다.' 
+        });
+      }
+      
+      connection = await pool.getConnection();
+      await connection.beginTransaction();
+      
+      // 기존 데이터 삭제 후 새로 삽입
+      await connection.query('TRUNCATE TABLE repair_history');
+      
+      let totalInserted = 0;
+      let errorCount = 0;
+      
+      for (const stmt of insertStatements) {
+        try {
+          await connection.query(stmt);
+          totalInserted++;
+        } catch (err) {
+          errorCount++;
+          // 개별 INSERT 오류는 계속 진행
+          console.warn(`⚠️ INSERT 오류 (건너뜀): ${err.message}`);
+        }
+      }
+      
       await connection.commit();
-      res.json({ success: true, count: totalInserted });
+      console.log(`✅ SQL 업로드 완료: ${totalInserted}건 삽입, ${errorCount}건 오류`);
+      
+      res.json({ 
+        success: true, 
+        count: totalInserted,
+        errors: errorCount,
+        message: `${totalInserted}건이 성공적으로 업로드되었습니다.`
+      });
+      
     } catch (error) {
       if (connection) await connection.rollback();
+      console.error('❌ SQL 업로드 오류:', error.message);
       res.status(500).json({ success: false, message: error.message });
     } finally {
       if (connection) connection.release();
     }
   });
 
-  // 3. 고객 검색 API
+  // 3. ✅ 고객 검색 API (repair_history 기반으로 수정!)
+  // - 고객명으로 검색하면 해당 고객의 전화번호 + 상담이력을 모두 반환
   app.get('/api/customers/search', async (req, res) => {
     const { name } = req.query;
-    if (!name) return res.json([]);
+    if (!name || name.trim() === '') return res.json([]);
     try {
-      const [rows] = await pool.query('SELECT * FROM customers WHERE customer_name LIKE ? LIMIT 50', [`${name}%`]);
+      const searchPattern = `%${name.trim()}%`;
+      
+      // repair_history에서 고객명으로 검색 (중복 제거하여 고객 목록 반환)
+      const [rows] = await pool.query(
+        `SELECT DISTINCT 
+           \`고객명_x\` as customer_name,
+           \`이동통신_x\` as mobile,
+           \`회사명\` as company_name
+         FROM repair_history 
+         WHERE \`고객명_x\` LIKE ? 
+            OR \`회사명\` LIKE ?
+            OR \`이동통신_x\` LIKE ?
+         ORDER BY \`고객명_x\`
+         LIMIT 50`,
+        [searchPattern, searchPattern, searchPattern]
+      );
+      
+      console.log(`🔍 검색어: "${name}" → ${rows.length}명 검색됨`);
       res.json(rows);
     } catch (error) {
-      res.json([]);
+      console.error('❌ 검색 오류:', error.message);
+      res.status(500).json({ success: false, message: error.message });
     }
   });
 
-  // 4. 전체 고객 수 조회 API
+  // 4. ✅ 고객별 전체 상담이력 조회 API (새로 추가!)
+  // - 특정 고객명을 클릭하면 해당 고객의 모든 상담 이력을 반환
+  app.get('/api/customers/history', async (req, res) => {
+    const { name } = req.query;
+    if (!name) return res.json([]);
+    try {
+      const [rows] = await pool.query(
+        `SELECT * FROM repair_history 
+         WHERE \`고객명_x\` = ?
+         ORDER BY \`접수일\` DESC`,
+        [name]
+      );
+      res.json(rows);
+    } catch (error) {
+      console.error('❌ 고객 이력 조회 오류:', error.message);
+      res.status(500).json({ success: false, message: error.message });
+    }
+  });
+
+  // 5. repair_history 전체 건수 조회 API
   app.get('/api/customers/count', async (req, res) => {
     try {
-      const [rows] = await pool.query('SELECT COUNT(*) as count FROM customers');
+      const [rows] = await pool.query('SELECT COUNT(*) as count FROM repair_history');
       res.json({ count: rows[0].count });
     } catch (error) {
+      console.error('❌ 건수 조회 오류:', error.message);
       res.status(500).json({ count: 0 });
     }
   });
 
-  // 5. 수리 이력 조회 API
+  // 6. 수리 이력 조회 API (고객 상담내역 탭)
   app.get('/api/repair-history', async (req, res) => {
     const { search } = req.query;
     let query = 'SELECT * FROM repair_history';
     let params = [];
-    if (search) {
+    if (search && search.trim()) {
       query += ' WHERE `고객명_x` LIKE ? OR `이동통신_x` LIKE ? OR `회사명` LIKE ? OR `상담내역` LIKE ?';
-      const searchPattern = `%${search}%`;
+      const searchPattern = `%${search.trim()}%`;
       params = [searchPattern, searchPattern, searchPattern, searchPattern];
     }
     query += ' ORDER BY `접수일` DESC LIMIT 100';
@@ -178,6 +256,7 @@ async function startServer() {
       const [rows] = await pool.query(query, params);
       res.json(rows);
     } catch (error) {
+      console.error('❌ 수리 이력 조회 오류:', error.message);
       res.status(500).json({ success: false, message: error.message });
     }
   });
@@ -194,7 +273,7 @@ async function startServer() {
   }
 
   app.listen(PORT, '0.0.0.0', () => {
-    console.log(`Unified Server running on http://localhost:${PORT}`);
+    console.log(`✅ 서버 실행 중: http://localhost:${PORT}`);
   });
 }
 
